@@ -34,7 +34,8 @@ let useWebSocket = true;  // 是否使用 WebSocket
 let wsHeartbeatInterval = null;  // 心跳定时器
 let batchWsHeartbeatInterval = null;  // 批量任务心跳定时器
 let activeTaskUuid = null;   // 当前活跃的单任务 UUID（用于页面重新可见时重连）
-let activeBatchId = null;    // 当前活跃的批量任务 ID（用于页面重新可见时重连）
+let activeBatchId = null;    // 当前活跃的批量任务 ID
+let _buttonResetTimer = null; // 按钮重置 backup 定时器（3分钟兜底）（用于页面重新可见时重连）
 
 // DOM 元素
 const elements = {
@@ -591,6 +592,14 @@ function connectWebSocket(taskUuid) {
             console.log('WebSocket 连接关闭:', event.code);
             stopWebSocketHeartbeat();
 
+            // 如果任务未完成，设置3分钟backup定时器兜底重置按钮
+            if (!taskCompleted) {
+                _buttonResetTimer = setTimeout(() => {
+                    console.log('[backup] WebSocket关闭后任务未完成，强制重置按钮');
+                    resetButtons();
+                }, 180000);
+            }
+
             // 只有在任务未完成且最终状态不是完成状态时才切换到轮询
             // 使用 taskFinalStatus 而不是 currentTask.status，因为 currentTask 可能已被重置
             const shouldPoll = !taskCompleted &&
@@ -1045,6 +1054,11 @@ function getLogType(log) {
 
 // 重置按钮状态
 function resetButtons() {
+    // 取消 backup 定时器
+    if (_buttonResetTimer) {
+        clearTimeout(_buttonResetTimer);
+        _buttonResetTimer = null;
+    }
     elements.startBtn.disabled = false;
     elements.cancelBtn.disabled = true;
     currentTask = null;
@@ -1298,6 +1312,14 @@ function connectBatchWebSocket(batchId) {
         batchWebSocket.onclose = (event) => {
             console.log('批量任务 WebSocket 连接关闭:', event.code);
             stopBatchWebSocketHeartbeat();
+
+            // 如果任务未完成，设置3分钟backup定时器兜底重置按钮
+            if (!batchCompleted) {
+                _buttonResetTimer = setTimeout(() => {
+                    console.log('[backup] WebSocket关闭后任务未完成，强制重置按钮');
+                    resetButtons();
+                }, 180000);
+            }
 
             // 只有在任务未完成且最终状态不是完成状态时才切换到轮询
             // 使用 batchFinalStatus 而不是 currentBatch.status，因为 currentBatch 可能已被重置

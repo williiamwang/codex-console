@@ -174,19 +174,30 @@ def create_app() -> FastAPI:
         from ..database.init_db import initialize_database
 
         # 确保数据库已初始化（reload 模式下子进程也需要初始化）
+        # 必须在 get_settings() 之前调用，确保配置从 DB 加载而非缓存默认值
         try:
             initialize_database()
         except Exception as e:
             logger.warning(f"数据库初始化: {e}")
+
+        # 重新加载 settings（清除缓存的默认值），确保从数据库读取最新值
+        from ..config.settings import get_settings, _settings
+        global _settings
+        try:
+            _settings = None  # 重置缓存，强制重新加载
+            fresh_settings = get_settings()
+            logger.info(f"动态代理设置加载: enabled={fresh_settings.proxy_dynamic_enabled}, api_url={fresh_settings.proxy_dynamic_api_url[:30] if fresh_settings.proxy_dynamic_api_url else '(空)'}...")
+        except Exception as e:
+            logger.warning(f"重新加载设置失败: {e}")
 
         # 设置 TaskManager 的事件循环
         loop = asyncio.get_event_loop()
         task_manager.set_loop(loop)
 
         logger.info("=" * 50)
-        logger.info(f"{settings.app_name} v{settings.app_version} 启动中，程序正在伸懒腰...")
-        logger.info(f"调试模式: {settings.debug}")
-        logger.info(f"数据库连接已接好线: {settings.database_url}")
+        logger.info(f"{fresh_settings.app_name} v{fresh_settings.app_version} 启动中，程序正在伸懒腰...")
+        logger.info(f"调试模式: {fresh_settings.debug}")
+        logger.info(f"数据库连接已接好线: {fresh_settings.database_url}")
         logger.info("=" * 50)
 
     @app.on_event("shutdown")

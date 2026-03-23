@@ -108,12 +108,13 @@ class RegistrationEngine:
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
+        self.settings = get_settings()
 
         # 创建 HTTP 客户端
         self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
 
         # 创建 OAuth 管理器
-        settings = get_settings()
+        settings = self.settings
         self.oauth_manager = OAuthManager(
             client_id=settings.openai_client_id,
             auth_url=settings.openai_auth_url,
@@ -219,6 +220,8 @@ class RegistrationEngine:
             return None
 
         max_attempts = 3
+        # Device ID 阶段超时取 registration_timeout 和 10 秒中的较小值，避免慢代理卡太久
+        device_timeout = min(getattr(self.settings, 'registration_timeout', 120), 10)
         for attempt in range(1, max_attempts + 1):
             try:
                 if not self.session:
@@ -226,7 +229,7 @@ class RegistrationEngine:
 
                 response = self.session.get(
                     self.oauth_start.auth_url,
-                    timeout=20
+                    timeout=device_timeout
                 )
                 did = self.session.cookies.get("oai-did")
 

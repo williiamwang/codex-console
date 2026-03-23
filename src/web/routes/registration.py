@@ -6,6 +6,7 @@ import asyncio
 import logging
 import uuid
 import random
+import requests
 from datetime import datetime
 from typing import List, Optional, Dict, Tuple
 
@@ -506,6 +507,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 task_manager.update_status(task_uuid, "completed", email=result.email)
 
                 logger.info(f"注册任务完成: {task_uuid}, 邮箱: {result.email}")
+
+                # 反馈给代理池
+                if actual_proxy_url:
+                    try:
+                        requests.post("http://127.0.0.1:8001/feedback", json={"proxy": actual_proxy_url, "success": True}, timeout=3)
+                    except Exception:
+                        pass
             else:
                 # 更新任务状态为失败
                 crud.update_registration_task(
@@ -519,6 +527,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 task_manager.update_status(task_uuid, "failed", error=result.error_message)
 
                 logger.warning(f"注册任务失败: {task_uuid}, 原因: {result.error_message}")
+
+                # 反馈给代理池
+                if actual_proxy_url:
+                    try:
+                        requests.post("http://127.0.0.1:8001/feedback", json={"proxy": actual_proxy_url, "success": False}, timeout=3)
+                    except Exception:
+                        pass
 
         except Exception as e:
             logger.error(f"注册任务异常: {task_uuid}, 错误: {e}")
@@ -534,6 +549,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "failed", error=str(e))
+
+                # 反馈给代理池
+                if actual_proxy_url:
+                    try:
+                        requests.post("http://127.0.0.1:8001/feedback", json={"proxy": actual_proxy_url, "success": False}, timeout=3)
+                    except Exception:
+                        pass
             except:
                 pass
 
@@ -636,13 +658,32 @@ async def run_batch_parallel(
     async def _run_one(idx: int, uuid: str):
         prefix = f"[任务{idx + 1}]"
         async with semaphore:
-            await run_registration_task(
-                uuid, email_service_type, proxy, email_service_config, email_service_id,
-                log_prefix=prefix, batch_id=batch_id,
-                auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
-                auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
-                auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids or [],
-            )
+            try:
+                async with asyncio.timeout(180):
+                    await run_registration_task(
+                        uuid, email_service_type, proxy, email_service_config, email_service_id,
+                        log_prefix=prefix, batch_id=batch_id,
+                        auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
+                        auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
+                        auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids or [],
+                    )
+            except asyncio.TimeoutError:
+                add_batch_log(f"{prefix} [失败] 注册超时（3分钟）")
+                with get_db() as db:
+                    crud.update_registration_task(
+                        db, uuid,
+                        status="failed",
+                        completed_at=datetime.utcnow(),
+                        error_message="注册超时（3分钟）"
+                    )
+                    task_manager.update_status(uuid, "failed", error="注册超时（3分钟）")
+                    # 反馈给代理池（超时也记录）
+                    try:
+                        t = crud.get_registration_task(db, uuid)
+                        if t and t.proxy:
+                            requests.post("http://127.0.0.1:8001/feedback", json={"proxy": t.proxy, "success": False}, timeout=3)
+                    except Exception:
+                        pass
         with get_db() as db:
             t = crud.get_registration_task(db, uuid)
             if t:
@@ -657,6 +698,13 @@ async def run_batch_parallel(
                         new_failed += 1
                         add_batch_log(f"{prefix} [失败] 注册失败: {t.error_message}")
                     update_batch_status(completed=new_completed, success=new_success, failed=new_failed)
+
+                # 反馈给代理池
+                if t and t.proxy:
+                    try:
+                        requests.post("http://127.0.0.1:8001/feedback", json={"proxy": t.proxy, "success": t.status == "completed"}, timeout=3)
+                    except Exception:
+                        pass
 
     try:
         await asyncio.gather(*[_run_one(i, u) for i, u in enumerate(task_uuids)], return_exceptions=True)
@@ -702,29 +750,54 @@ async def run_batch_pipeline(
 
     async def _run_and_release(idx: int, uuid: str, pfx: str):
         try:
-            await run_registration_task(
-                uuid, email_service_type, proxy, email_service_config, email_service_id,
-                log_prefix=pfx, batch_id=batch_id,
-                auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
-                auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
-                auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids or [],
-            )
+            async with asyncio.timeout(180):
+                await run_registration_task(
+                    uuid, email_service_type, proxy, email_service_config, email_service_id,
+                    log_prefix=pfx, batch_id=batch_id,
+                    auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
+                    auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
+                    auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids or [],
+                )
+        except asyncio.TimeoutError:
+            add_batch_log(f"{pfx} [失败] 注册超时（3分钟）")
             with get_db() as db:
-                t = crud.get_registration_task(db, uuid)
-                if t:
-                    async with counter_lock:
-                        new_completed = batch_tasks[batch_id]["completed"] + 1
-                        new_success = batch_tasks[batch_id]["success"]
-                        new_failed = batch_tasks[batch_id]["failed"]
-                        if t.status == "completed":
-                            new_success += 1
-                            add_batch_log(f"{pfx} [成功] 注册成功")
-                        elif t.status == "failed":
-                            new_failed += 1
-                            add_batch_log(f"{pfx} [失败] 注册失败: {t.error_message}")
-                        update_batch_status(completed=new_completed, success=new_success, failed=new_failed)
+                crud.update_registration_task(
+                    db, uuid,
+                    status="failed",
+                    completed_at=datetime.utcnow(),
+                    error_message="注册超时（3分钟）"
+                )
+                task_manager.update_status(uuid, "failed", error="注册超时（3分钟）")
+                # 反馈给代理池（超时也记录）
+                try:
+                    t = crud.get_registration_task(db, uuid)
+                    if t and t.proxy:
+                        requests.post("http://127.0.0.1:8001/feedback", json={"proxy": t.proxy, "success": False}, timeout=3)
+                except Exception:
+                    pass
         finally:
             semaphore.release()
+        with get_db() as db:
+            t = crud.get_registration_task(db, uuid)
+            if t:
+                async with counter_lock:
+                    new_completed = batch_tasks[batch_id]["completed"] + 1
+                    new_success = batch_tasks[batch_id]["success"]
+                    new_failed = batch_tasks[batch_id]["failed"]
+                    if t.status == "completed":
+                        new_success += 1
+                        add_batch_log(f"{pfx} [成功] 注册成功")
+                    elif t.status == "failed":
+                        new_failed += 1
+                        add_batch_log(f"{pfx} [失败] 注册失败: {t.error_message}")
+                    update_batch_status(completed=new_completed, success=new_success, failed=new_failed)
+
+                # 反馈给代理池
+                if t and t.proxy:
+                    try:
+                        requests.post("http://127.0.0.1:8001/feedback", json={"proxy": t.proxy, "success": t.status == "completed"}, timeout=3)
+                    except Exception:
+                        pass
 
     try:
         for i, task_uuid in enumerate(task_uuids):
