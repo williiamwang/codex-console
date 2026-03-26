@@ -2,11 +2,14 @@
 设置 API 路由
 """
 
+import ipaddress
 import logging
 import os
-from typing import Optional
+import re
+from typing import List, Optional
+from urllib.parse import urlsplit, unquote
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel
 
 from ...config.settings import get_settings, update_settings
@@ -469,6 +472,150 @@ class ProxyUpdateRequest(BaseModel):
     priority: Optional[int] = None
 
 
+class ProxyBulkImportRequest(BaseModel):
+    """批量导入代理请求"""
+    raw_text: str
+    default_type: str = "http"
+    enabled: bool = True
+
+
+class ProxyTestAllRequest(BaseModel):
+    """批量测试代理请求"""
+    auto_disable_failed: bool = False
+
+
+class ProxyBatchDeleteRequest(BaseModel):
+    """批量删除代理请求"""
+    proxy_ids: List[int]
+
+
+_PROXY_URL_RE = re.compile(r"(?P<url>(?:https?|socks5h?)://[^\s'\"<>]+)", re.IGNORECASE)
+_PROXY_HOST_PORT_RE = re.compile(r"(?P<host>[A-Za-z0-9.-]+):(?P<port>\d{1,5})")
+
+
+def _normalize_proxy_type(proxy_type: str) -> Optional[str]:
+    proxy_type = (proxy_type or "").strip().lower()
+    if proxy_type == "https":
+        return "http"
+    if proxy_type in ("http", "socks5", "socks5h"):
+        return proxy_type
+    return None
+
+
+def _is_valid_host(host: str) -> bool:
+    if not host:
+        return False
+
+    host = host.strip().lower()
+    if not host:
+        return False
+
+    try:
+        ipaddress.IPv4Address(host)
+        return True
+    except ValueError:
+        pass
+
+    if host == "localhost":
+        return True
+
+    if len(host) > 253 or " " in host or ".." in host:
+        return False
+
+    if not re.fullmatch(r"[a-z0-9.-]+", host):
+        return False
+
+    if host.startswith(("-", ".")) or host.endswith(("-", ".")):
+        return False
+
+    labels = host.split(".")
+    for label in labels:
+        if not label or len(label) > 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+
+    return True
+
+
+def _extract_proxies_from_text(raw_text: str, default_type: str):
+    candidates = []
+    invalid_samples = []
+
+    normalized_default_type = _normalize_proxy_type(default_type)
+    if not normalized_default_type:
+        normalized_default_type = "http"
+
+    working_text = raw_text or ""
+
+    for match in _PROXY_URL_RE.finditer(working_text):
+        raw_token = match.group("url").rstrip(",.;:)]}>\"'，。；：）】》")
+
+        try:
+            parsed = urlsplit(raw_token)
+            proxy_type = _normalize_proxy_type(parsed.scheme)
+            host = (parsed.hostname or "").strip().lower()
+            port = parsed.port
+            username = unquote(parsed.username) if parsed.username else None
+            password = unquote(parsed.password) if parsed.password else None
+
+            if not proxy_type:
+                invalid_samples.append({"raw": raw_token, "reason": "unsupported_scheme"})
+                continue
+
+            if not _is_valid_host(host):
+                invalid_samples.append({"raw": raw_token, "reason": "invalid_host"})
+                continue
+
+            if not port or port < 1 or port > 65535:
+                invalid_samples.append({"raw": raw_token, "reason": "invalid_port"})
+                continue
+
+            candidates.append({
+                "type": proxy_type,
+                "host": host,
+                "port": int(port),
+                "username": username,
+                "password": password,
+            })
+        except ValueError:
+            invalid_samples.append({"raw": raw_token, "reason": "invalid_url"})
+
+    text_without_urls = _PROXY_URL_RE.sub(" ", working_text)
+
+    for match in _PROXY_HOST_PORT_RE.finditer(text_without_urls):
+        host = (match.group("host") or "").strip().lower().strip("[](){}<>,;\"'")
+        port_str = (match.group("port") or "").strip()
+        raw_token = f"{host}:{port_str}"
+
+        if not host or not port_str:
+            continue
+
+        if not _is_valid_host(host):
+            invalid_samples.append({"raw": raw_token, "reason": "invalid_host"})
+            continue
+
+        try:
+            port = int(port_str)
+        except ValueError:
+            invalid_samples.append({"raw": raw_token, "reason": "invalid_port"})
+            continue
+
+        if port < 1 or port > 65535:
+            invalid_samples.append({"raw": raw_token, "reason": "invalid_port"})
+            continue
+
+        candidates.append({
+            "type": normalized_default_type,
+            "host": host,
+            "port": port,
+            "username": None,
+            "password": None,
+        })
+
+    return candidates, invalid_samples
+
+
 @router.get("/proxies")
 async def get_proxies_list(enabled: Optional[bool] = None):
     """获取代理列表"""
@@ -496,6 +643,92 @@ async def create_proxy_item(request: ProxyCreateRequest):
             priority=request.priority
         )
         return {"success": True, "proxy": proxy.to_dict()}
+
+
+@router.post("/proxies/bulk-import")
+async def bulk_import_proxies(request: ProxyBulkImportRequest):
+    """批量导入代理"""
+    raw_text = (request.raw_text or "").strip()
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="请提供代理文本")
+
+    candidates, invalid_samples = _extract_proxies_from_text(raw_text, request.default_type)
+
+    seen_in_input = set()
+    normalized_candidates = []
+    duplicate_in_input = 0
+
+    for item in candidates:
+        key = (
+            item["type"],
+            item["host"],
+            item["port"],
+            item.get("username") or "",
+            item.get("password") or "",
+        )
+        if key in seen_in_input:
+            duplicate_in_input += 1
+            continue
+        seen_in_input.add(key)
+        normalized_candidates.append(item)
+
+    imported = 0
+    duplicate_existing = 0
+
+    with get_db() as db:
+        existing = crud.get_proxies(db, limit=1000000)
+        existing_keys = {
+            (
+                (p.type or "").lower(),
+                (p.host or "").lower(),
+                p.port,
+                p.username or "",
+                p.password or "",
+            )
+            for p in existing
+        }
+
+        for idx, item in enumerate(normalized_candidates, start=1):
+            key = (
+                item["type"],
+                item["host"],
+                item["port"],
+                item.get("username") or "",
+                item.get("password") or "",
+            )
+
+            if key in existing_keys:
+                duplicate_existing += 1
+                continue
+
+            name = f"批量代理-{item['host']}:{item['port']}-{idx}"
+            crud.create_proxy(
+                db,
+                name=name,
+                type=item["type"],
+                host=item["host"],
+                port=item["port"],
+                username=item.get("username"),
+                password=item.get("password"),
+                enabled=request.enabled,
+                priority=0,
+            )
+            existing_keys.add(key)
+            imported += 1
+
+    return {
+        "success": True,
+        "summary": {
+            "total_extracted": len(candidates),
+            "imported": imported,
+            "duplicate_in_input": duplicate_in_input,
+            "duplicate_existing": duplicate_existing,
+            "invalid": len(invalid_samples),
+        },
+        "details": {
+            "invalid_samples": invalid_samples[:20],
+        },
+    }
 
 
 @router.get("/proxies/{proxy_id}")
@@ -544,6 +777,35 @@ async def delete_proxy_item(proxy_id: int):
         if not success:
             raise HTTPException(status_code=404, detail="代理不存在")
         return {"success": True, "message": "代理已删除"}
+
+
+@router.post("/proxies/batch-delete")
+async def batch_delete_proxy_items(request: ProxyBatchDeleteRequest):
+    """批量删除代理"""
+    proxy_ids = [pid for pid in (request.proxy_ids or []) if isinstance(pid, int) and pid > 0]
+    if not proxy_ids:
+        raise HTTPException(status_code=400, detail="请提供有效的代理 ID 列表")
+
+    dedup_ids = list(dict.fromkeys(proxy_ids))
+    deleted_ids = []
+    not_found_ids = []
+
+    with get_db() as db:
+        for proxy_id in dedup_ids:
+            if crud.delete_proxy(db, proxy_id):
+                deleted_ids.append(proxy_id)
+            else:
+                not_found_ids.append(proxy_id)
+
+    return {
+        "success": True,
+        "message": "批量删除完成",
+        "requested_count": len(dedup_ids),
+        "deleted_count": len(deleted_ids),
+        "not_found_count": len(not_found_ids),
+        "deleted_ids": deleted_ids,
+        "not_found_ids": not_found_ids,
+    }
 
 
 @router.post("/proxies/{proxy_id}/set-default")
@@ -608,15 +870,19 @@ async def test_proxy_item(proxy_id: int):
 
 
 @router.post("/proxies/test-all")
-async def test_all_proxies():
+async def test_all_proxies(request: Optional[ProxyTestAllRequest] = Body(default=None)):
     """测试所有启用的代理"""
     import time
     from curl_cffi import requests as cffi_requests
 
     with get_db() as db:
         proxies = crud.get_enabled_proxies(db)
+        auto_disable_failed = bool(request.auto_disable_failed) if request else False
 
         results = []
+        failed_ids = []
+        auto_disabled = 0
+
         for proxy in proxies:
             proxy_url = proxy.proxy_url
             test_url = "https://api.ipify.org?format=json"
@@ -653,6 +919,9 @@ async def test_all_proxies():
                         "success": False,
                         "message": f"状态码: {response.status_code}"
                     })
+                    failed_ids.append(proxy.id)
+                    if auto_disable_failed and crud.update_proxy(db, proxy.id, enabled=False):
+                        auto_disabled += 1
 
             except Exception as e:
                 results.append({
@@ -661,12 +930,17 @@ async def test_all_proxies():
                     "success": False,
                     "message": str(e)
                 })
+                failed_ids.append(proxy.id)
+                if auto_disable_failed and crud.update_proxy(db, proxy.id, enabled=False):
+                    auto_disabled += 1
 
         success_count = sum(1 for r in results if r["success"])
         return {
             "total": len(proxies),
             "success": success_count,
             "failed": len(proxies) - success_count,
+            "auto_disabled": auto_disabled,
+            "failed_ids": failed_ids,
             "results": results
         }
 

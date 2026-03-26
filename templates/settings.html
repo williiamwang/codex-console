@@ -93,10 +93,16 @@
                 <div class="card" style="margin-top: var(--spacing-lg);">
                     <div class="card-header">
                         <h3>代理列表</h3>
-                        <div style="display: flex; gap: var(--spacing-sm);">
-                            <button class="btn btn-secondary btn-sm" id="test-all-proxies-btn">🔌 测试全部</button>
-                            <button class="btn btn-primary btn-sm" id="add-proxy-btn">➕ 添加代理</button>
+                        <div style="display:flex;gap:var(--spacing-sm);align-items:center;flex-wrap:wrap;">
+                            <button type="button" class="btn btn-secondary btn-sm" id="test-all-proxies-btn">🔌 测试全部</button>
+                            <button type="button" class="btn btn-secondary btn-sm" id="cleanup-failed-proxies-btn" disabled>🧹 清理失败项</button>
+                            <button type="button" class="btn btn-secondary btn-sm" id="bulk-add-proxy-btn">📥 批量导入</button>
+                            <button type="button" class="btn btn-primary btn-sm" id="add-proxy-btn">➕ 添加代理</button>
+                            <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--text-muted);margin-left:4px;">
+                                <input type="checkbox" id="auto-disable-failed-proxies"> 失败自动禁用（更安全）
+                            </label>
                         </div>
+                        <div style="margin-top:6px;font-size:0.8rem;color:var(--text-muted);">“清理失败项”仅针对最近一次“测试全部”失败的代理。</div>
                     </div>
                     <div class="card-body" style="padding: 0;">
                         <div class="table-container">
@@ -197,6 +203,46 @@
                                 <button type="submit" class="btn btn-primary">💾 保存</button>
                             </div>
                         </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 批量导入代理模态框 -->
+            <div class="modal" id="bulk-add-proxy-modal">
+                <div class="modal-content" style="max-width: 720px;">
+                    <div class="modal-header">
+                        <h3>批量导入代理</h3>
+                        <button class="modal-close" id="close-bulk-proxy-modal">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="form-group">
+                            <label for="bulk-proxy-input">代理文本</label>
+                            <textarea id="bulk-proxy-input" rows="10" placeholder="可粘贴混杂文本，系统会自动识别代理地址，例如：
+127.0.0.1:7890
+socks5://user:pass@10.0.0.2:1080
+这里还有一些无关文字 http://proxy.example.com:8080"></textarea>
+                            <small style="color: var(--text-muted);">支持自动识别 IP:端口、域名:端口、http/socks5 代理 URL，无关内容会自动忽略。</small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="bulk-proxy-default-type">默认类型（用于无协议条目）</label>
+                                <select id="bulk-proxy-default-type">
+                                    <option value="http">HTTP</option>
+                                    <option value="socks5">SOCKS5</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>&nbsp;</label>
+                                <label style="margin-top:10px;display:flex;align-items:center;gap:8px;">
+                                    <input type="checkbox" id="bulk-proxy-enabled" checked> 导入后启用
+                                </label>
+                            </div>
+                        </div>
+                        <div id="bulk-proxy-result" style="display:none;margin-bottom:var(--spacing-md);"></div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-secondary" id="cancel-bulk-proxy-btn">取消</button>
+                            <button type="button" class="btn btn-primary" id="bulk-import-proxy-btn">📥 开始导入</button>
+                        </div>
                     </div>
                 </div>
             </div>

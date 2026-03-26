@@ -64,6 +64,16 @@ def update_proxy_usage(db, proxy_id: Optional[int]):
         crud.update_proxy_last_used(db, proxy_id)
 
 
+def cleanup_failed_manual_proxy(db, proxy_id: Optional[int], batch_id: str, task_uuid: str):
+    """手动注册失败时删除本次使用的数据库代理。"""
+    if batch_id or not proxy_id:
+        return
+
+    if crud.delete_proxy(db, proxy_id):
+        logger.info(f"任务 {task_uuid} 注册失败，已删除失败代理 ID={proxy_id}")
+    else:
+        logger.warning(f"任务 {task_uuid} 注册失败，删除失败代理 ID={proxy_id} 未生效（可能已不存在）")
+
 # ============== Pydantic Models ==============
 
 class RegistrationTaskCreate(BaseModel):
@@ -228,6 +238,8 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
     这个函数会被 run_in_executor 调用，运行在独立线程中
     """
+    proxy_id: Optional[int] = None
+
     with get_db() as db:
         try:
             # 检查是否已取消
@@ -523,6 +535,8 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     error_message=result.error_message
                 )
 
+                cleanup_failed_manual_proxy(db, proxy_id, batch_id, task_uuid)
+
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "failed", error=result.error_message)
 
@@ -546,6 +560,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         completed_at=datetime.utcnow(),
                         error_message=str(e)
                     )
+                    cleanup_failed_manual_proxy(db, proxy_id, batch_id, task_uuid)
 
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "failed", error=str(e))

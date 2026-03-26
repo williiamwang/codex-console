@@ -30,8 +30,19 @@ const elements = {
     // 代理列表
     proxiesTable: document.getElementById('proxies-table'),
     addProxyBtn: document.getElementById('add-proxy-btn'),
+    bulkAddProxyBtn: document.getElementById('bulk-add-proxy-btn'),
     testAllProxiesBtn: document.getElementById('test-all-proxies-btn'),
+    cleanupFailedProxiesBtn: document.getElementById('cleanup-failed-proxies-btn'),
+    autoDisableFailedProxies: document.getElementById('auto-disable-failed-proxies'),
     addProxyModal: document.getElementById('add-proxy-modal'),
+    bulkAddProxyModal: document.getElementById('bulk-add-proxy-modal'),
+    closeBulkProxyModal: document.getElementById('close-bulk-proxy-modal'),
+    cancelBulkProxyBtn: document.getElementById('cancel-bulk-proxy-btn'),
+    bulkImportProxyBtn: document.getElementById('bulk-import-proxy-btn'),
+    bulkProxyInput: document.getElementById('bulk-proxy-input'),
+    bulkProxyDefaultType: document.getElementById('bulk-proxy-default-type'),
+    bulkProxyEnabled: document.getElementById('bulk-proxy-enabled'),
+    bulkProxyResult: document.getElementById('bulk-proxy-result'),
     proxyItemForm: document.getElementById('proxy-item-form'),
     closeProxyModal: document.getElementById('close-proxy-modal'),
     cancelProxyBtn: document.getElementById('cancel-proxy-btn'),
@@ -76,6 +87,7 @@ const elements = {
 
 // 选中的服务 ID
 let selectedServiceIds = new Set();
+let lastFailedProxyIds = [];
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
@@ -204,6 +216,35 @@ function initEventListeners() {
 
     if (elements.testAllProxiesBtn) {
         elements.testAllProxiesBtn.addEventListener('click', handleTestAllProxies);
+    }
+
+    if (elements.cleanupFailedProxiesBtn) {
+        elements.cleanupFailedProxiesBtn.addEventListener('click', handleCleanupFailedProxies);
+        elements.cleanupFailedProxiesBtn.disabled = true;
+    }
+
+    if (elements.bulkAddProxyBtn) {
+        elements.bulkAddProxyBtn.addEventListener('click', openBulkProxyModal);
+    }
+
+    if (elements.closeBulkProxyModal) {
+        elements.closeBulkProxyModal.addEventListener('click', closeBulkProxyModal);
+    }
+
+    if (elements.cancelBulkProxyBtn) {
+        elements.cancelBulkProxyBtn.addEventListener('click', closeBulkProxyModal);
+    }
+
+    if (elements.bulkAddProxyModal) {
+        elements.bulkAddProxyModal.addEventListener('click', (e) => {
+            if (e.target === elements.bulkAddProxyModal) {
+                closeBulkProxyModal();
+            }
+        });
+    }
+
+    if (elements.bulkImportProxyBtn) {
+        elements.bulkImportProxyBtn.addEventListener('click', handleBulkImportProxies);
     }
 
     if (elements.closeProxyModal) {
@@ -879,6 +920,78 @@ function closeProxyModal() {
     elements.proxyItemForm.reset();
 }
 
+function openBulkProxyModal() {
+    if (!elements.bulkAddProxyModal) return;
+    elements.bulkProxyInput.value = '';
+    elements.bulkProxyResult.style.display = 'none';
+    elements.bulkProxyResult.innerHTML = '';
+    elements.bulkAddProxyModal.classList.add('active');
+}
+
+function closeBulkProxyModal() {
+    if (!elements.bulkAddProxyModal) return;
+    elements.bulkAddProxyModal.classList.remove('active');
+}
+
+function renderBulkProxyResult(result) {
+    if (!elements.bulkProxyResult) return;
+
+    const summary = result?.summary || {};
+    const details = result?.details || {};
+    const invalidSamples = details.invalid_samples || [];
+
+    const invalidHtml = invalidSamples.length > 0
+        ? `<div style="margin-top:8px;color:var(--warning-color);">无效示例：${invalidSamples.map(item => `${escapeHtml(item.raw || '')} (${escapeHtml(item.reason || 'invalid')})`).join('； ')}</div>`
+        : '';
+
+    elements.bulkProxyResult.style.display = 'block';
+    elements.bulkProxyResult.innerHTML = `
+        <div class="import-stats" style="display:flex;gap:12px;flex-wrap:wrap;">
+            <span>🔎 识别: ${summary.total_extracted || 0}</span>
+            <span>✅ 导入: ${summary.imported || 0}</span>
+            <span>♻️ 输入重复: ${summary.duplicate_in_input || 0}</span>
+            <span>📚 已存在: ${summary.duplicate_existing || 0}</span>
+            <span>❌ 无效: ${summary.invalid || 0}</span>
+        </div>
+        ${invalidHtml}
+    `;
+}
+
+async function handleBulkImportProxies() {
+    const rawText = elements.bulkProxyInput?.value?.trim() || '';
+    if (!rawText) {
+        toast.warning('请先粘贴代理文本');
+        return;
+    }
+
+    const btn = elements.bulkImportProxyBtn;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="loading-spinner"></span> 导入中...';
+
+    try {
+        const result = await api.post('/settings/proxies/bulk-import', {
+            raw_text: rawText,
+            default_type: elements.bulkProxyDefaultType?.value || 'http',
+            enabled: !!elements.bulkProxyEnabled?.checked
+        });
+
+        renderBulkProxyResult(result);
+
+        const imported = result?.summary?.imported || 0;
+        if (imported > 0) {
+            toast.success(`批量导入完成，成功 ${imported} 条`);
+            loadProxies();
+        } else {
+            toast.info('未导入新代理，请查看识别结果');
+        }
+    } catch (error) {
+        toast.error('批量导入失败: ' + error.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '📥 开始导入';
+    }
+}
+
 // 保存代理
 async function handleSaveProxyItem(e) {
     e.preventDefault();
@@ -891,8 +1004,11 @@ async function handleSaveProxyItem(e) {
         port: parseInt(document.getElementById('proxy-item-port').value),
         username: document.getElementById('proxy-item-username').value || null,
         password: document.getElementById('proxy-item-password').value || null,
-        enabled: true
     };
+
+    if (!proxyId) {
+        data.enabled = true;
+    }
 
     try {
         if (proxyId) {
@@ -959,20 +1075,76 @@ async function deleteProxyItem(id) {
     }
 }
 
+function updateCleanupFailedProxiesButton() {
+    if (!elements.cleanupFailedProxiesBtn) return;
+    elements.cleanupFailedProxiesBtn.disabled = lastFailedProxyIds.length === 0;
+}
+
 // 测试所有代理
 async function handleTestAllProxies() {
     elements.testAllProxiesBtn.disabled = true;
     elements.testAllProxiesBtn.innerHTML = '<span class="loading-spinner"></span> 测试中...';
 
+    const autoDisableFailed = !!elements.autoDisableFailedProxies?.checked;
+
     try {
-        const result = await api.post('/settings/proxies/test-all');
-        toast.info(`测试完成: 成功 ${result.success}, 失败 ${result.failed}`);
+        const result = await api.post('/settings/proxies/test-all', {
+            auto_disable_failed: autoDisableFailed
+        });
+
+        lastFailedProxyIds = Array.isArray(result.failed_ids) ? [...new Set(result.failed_ids)] : [];
+        updateCleanupFailedProxiesButton();
+
+        const autoDisabledCount = result.auto_disabled || 0;
+        const suffix = autoDisableFailed ? `，自动禁用 ${autoDisabledCount}` : '';
+        toast.info(`测试完成: 成功 ${result.success}, 失败 ${result.failed}${suffix}`);
         loadProxies();
     } catch (error) {
         toast.error('测试失败: ' + error.message);
     } finally {
         elements.testAllProxiesBtn.disabled = false;
         elements.testAllProxiesBtn.textContent = '🔌 测试全部';
+    }
+}
+
+async function handleCleanupFailedProxies() {
+    if (!lastFailedProxyIds.length) {
+        toast.info('暂无可清理的失败代理，请先执行“测试全部”');
+        updateCleanupFailedProxiesButton();
+        return;
+    }
+
+    const confirmed = await confirm(`确定清理最近一次测试失败的 ${lastFailedProxyIds.length} 个代理吗？`);
+    if (!confirmed) return;
+
+    const btn = elements.cleanupFailedProxiesBtn;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="loading-spinner"></span> 清理中...';
+
+    try {
+        const result = await api.post('/settings/proxies/batch-delete', {
+            proxy_ids: lastFailedProxyIds
+        });
+
+        const deletedIds = Array.isArray(result.deleted_ids) ? result.deleted_ids : [];
+        const notFoundIds = Array.isArray(result.not_found_ids) ? result.not_found_ids : [];
+
+        lastFailedProxyIds = notFoundIds;
+        updateCleanupFailedProxiesButton();
+
+        if (notFoundIds.length > 0) {
+            toast.warning(`清理完成: 成功 ${deletedIds.length}，未找到 ${notFoundIds.length}`);
+        } else {
+            toast.success(`清理完成: 成功删除 ${deletedIds.length} 个失败代理`);
+        }
+
+        await loadProxies();
+    } catch (error) {
+        toast.error('清理失败: ' + error.message);
+        updateCleanupFailedProxiesButton();
+    } finally {
+        btn.disabled = lastFailedProxyIds.length === 0;
+        btn.textContent = '🧹 清理失败项';
     }
 }
 
@@ -1533,9 +1705,3 @@ async function handleTestSub2ApiService() {
     }
 }
 
-function escapeHtml(text) {
-    if (!text) return '';
-    const d = document.createElement('div');
-    d.textContent = text;
-    return d.innerHTML;
-}
