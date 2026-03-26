@@ -9,6 +9,7 @@ import random
 import requests
 from datetime import datetime
 from typing import List, Optional, Dict, Tuple
+from urllib.parse import urlsplit, unquote
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -64,15 +65,76 @@ def update_proxy_usage(db, proxy_id: Optional[int]):
         crud.update_proxy_last_used(db, proxy_id)
 
 
-def cleanup_failed_manual_proxy(db, proxy_id: Optional[int], batch_id: str, task_uuid: str):
-    """手动注册失败时删除本次使用的数据库代理。"""
-    if batch_id or not proxy_id:
+def _resolve_proxy_id_from_url(db, proxy_url: Optional[str]) -> Optional[int]:
+    """根据实际代理 URL 尝试定位数据库中的代理 ID。"""
+    if not proxy_url:
+        return None
+
+    raw = proxy_url.strip()
+    if not raw:
+        return None
+
+    if "://" not in raw:
+        raw = f"http://{raw}"
+
+    try:
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").strip().lower()
+        port = parsed.port
+        username = unquote(parsed.username) if parsed.username else None
+        password = unquote(parsed.password) if parsed.password else None
+    except Exception:
+        return None
+
+    if not host or not port:
+        return None
+
+    proxy_type = (parsed.scheme or "http").lower()
+    if proxy_type == "https":
+        proxy_type = "http"
+    if proxy_type not in ("http", "socks5", "socks5h"):
+        return None
+
+    with_password = password if password is not None else None
+    with_username = username if username is not None else None
+
+    candidates = crud.get_proxies(db, limit=1000000)
+    for p in candidates:
+        if (p.type or "").lower() != proxy_type:
+            continue
+        if (p.host or "").strip().lower() != host:
+            continue
+        if p.port != int(port):
+            continue
+        p_user = p.username if p.username is not None else None
+        p_pass = p.password if p.password is not None else None
+        if p_user == with_username and p_pass == with_password:
+            return p.id
+
+    # 兼容“只匹配 host:port:type”（当任务侧没有用户名密码时）
+    for p in candidates:
+        if (p.type or "").lower() == proxy_type and (p.host or "").strip().lower() == host and p.port == int(port):
+            return p.id
+
+    return None
+
+
+def cleanup_failed_proxy(db, proxy_id: Optional[int], task_uuid: str):
+    """注册失败时同步删除本次使用的数据库代理整行记录。"""
+    if not proxy_id:
         return
 
     if crud.delete_proxy(db, proxy_id):
-        logger.info(f"任务 {task_uuid} 注册失败，已删除失败代理 ID={proxy_id}")
+        logger.info(f"任务 {task_uuid} 注册失败，已同步删除失败代理整行记录 ID={proxy_id}")
     else:
         logger.warning(f"任务 {task_uuid} 注册失败，删除失败代理 ID={proxy_id} 未生效（可能已不存在）")
+
+    # 立即检查删除结果，避免出现“IP 为空但行还在”的错觉
+    remained = crud.get_proxy_by_id(db, proxy_id)
+    if remained:
+        logger.error(f"任务 {task_uuid} 代理删除后仍存在 ID={proxy_id}，请检查并发写入")
+    else:
+        logger.info(f"任务 {task_uuid} 代理 ID={proxy_id} 已确认不存在")
 
 # ============== Pydantic Models ==============
 
@@ -535,7 +597,8 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     error_message=result.error_message
                 )
 
-                cleanup_failed_manual_proxy(db, proxy_id, batch_id, task_uuid)
+                failed_proxy_id = proxy_id if proxy_id else _resolve_proxy_id_from_url(db, actual_proxy_url)
+                cleanup_failed_proxy(db, failed_proxy_id, task_uuid)
 
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "failed", error=result.error_message)
@@ -560,7 +623,8 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         completed_at=datetime.utcnow(),
                         error_message=str(e)
                     )
-                    cleanup_failed_manual_proxy(db, proxy_id, batch_id, task_uuid)
+                    failed_proxy_id = proxy_id if proxy_id else _resolve_proxy_id_from_url(db, actual_proxy_url)
+                    cleanup_failed_proxy(db, failed_proxy_id, task_uuid)
 
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "failed", error=str(e))
