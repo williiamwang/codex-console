@@ -67,9 +67,6 @@ def backfill_proxy_if_dynamic_success(db, proxy_id: Optional[int], proxy_url: Op
         return
 
     host, port = endpoint
-    existed = _get_proxy_group_by_host_port(db, host, port)
-    if existed:
-        return
 
     raw = (proxy_url or "").strip()
     scheme = "http"
@@ -84,9 +81,22 @@ def backfill_proxy_if_dynamic_success(db, proxy_id: Optional[int], proxy_url: Op
 
     proxy_type = "socks5" if scheme.startswith("socks5") else "http"
 
+    existed_group = _get_proxy_group_by_host_port(db, host, port)
+    for item in existed_group:
+        same_type = (item.type or "http") == proxy_type
+        same_user = (item.username or None) == (username or None)
+        same_pass = (item.password or None) == (password or None)
+        if same_type and same_user and same_pass:
+            return
+
+    existing_names = {item.name for item in existed_group}
+    proxy_name = f"动态回灌-{host}:{port}"
+    if proxy_name in existing_names:
+        proxy_name = f"动态回灌-{host}:{port}-{username or 'anonymous'}"
+
     crud.create_proxy(
         db,
-        name=f"动态回灌-{host}:{port}",
+        name=proxy_name,
         type=proxy_type,
         host=host,
         port=port,
@@ -95,6 +105,8 @@ def backfill_proxy_if_dynamic_success(db, proxy_id: Optional[int], proxy_url: Op
         enabled=True,
         priority=0,
     )
+
+    return
 
 
 def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
@@ -290,9 +302,15 @@ def _is_transient_proxy_failure(error_message: Optional[str]) -> bool:
     return any(keyword in message for keyword in transient_keywords)
 
 
-def should_delete_proxy_after_failure(error_message: Optional[str], fail_count: int) -> bool:
-    """失败删除判定：常规连续失败>=3删除；瞬时网络错误提高阈值到>=5。"""
+def should_delete_proxy_after_failure(error_message: Optional[str], fail_count: int, has_recent_success: bool = False) -> bool:
+    """失败删除判定：
+    - 常规连续失败 >=3 删除
+    - 瞬时网络错误连续失败 >=5 删除
+    - 若该代理组近期有成功使用记录（last_used），阈值至少提高到 5，避免刚成功就被快速删空
+    """
     threshold = 5 if _is_transient_proxy_failure(error_message) else 3
+    if has_recent_success:
+        threshold = max(threshold, 5)
     return fail_count >= threshold
 
 
@@ -330,7 +348,9 @@ def cleanup_failed_proxy(
         last_failure_reason=(error_message or "")[:500],
     )
 
-    if not should_delete_proxy_after_failure(error_message, next_fail_count):
+    has_recent_success = any(getattr(p, "last_used", None) is not None for p in proxies)
+
+    if not should_delete_proxy_after_failure(error_message, next_fail_count, has_recent_success=has_recent_success):
         logger.info(
             f"任务 {task_uuid} 代理失败计数更新 host={host} port={port} fail_count={next_fail_count}，未达到删除阈值"
         )

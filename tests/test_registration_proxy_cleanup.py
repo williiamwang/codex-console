@@ -105,6 +105,32 @@ def test_backfill_dynamic_proxy_on_success_skips_when_already_exists(tmp_path):
         assert len(matched) == 1
 
 
+def test_backfill_dynamic_proxy_on_success_creates_when_same_host_port_but_auth_differs(tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with manager.session_scope() as session:
+        crud.create_proxy(
+            session,
+            name="existing-auth",
+            type="http",
+            host="dup-auth.example",
+            port=9011,
+            username="old_user",
+            password="old_pass",
+            enabled=True,
+        )
+
+        registration_routes.backfill_proxy_if_dynamic_success(
+            session,
+            proxy_id=None,
+            proxy_url="http://new_user:new_pass@dup-auth.example:9011",
+        )
+
+        matched = session.query(Proxy).filter(Proxy.host == "dup-auth.example", Proxy.port == 9011).all()
+        assert len(matched) == 2
+        assert any(p.username == "new_user" and p.password == "new_pass" for p in matched)
+
+
 def test_backfill_dynamic_proxy_on_success_skips_pool_proxy(tmp_path):
     manager = _build_manager(tmp_path)
 
@@ -341,6 +367,52 @@ def test_cleanup_failed_proxy_transient_error_uses_higher_threshold(tmp_path):
         assert left == 1
         proxy = session.query(Proxy).filter(Proxy.host == "transient.example", Proxy.port == 9400).one()
         assert proxy.fail_count == 3
+
+
+def test_cleanup_failed_proxy_keeps_recently_successful_dynamic_backfill(tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with manager.session_scope() as session:
+        registration_routes.backfill_proxy_if_dynamic_success(
+            session,
+            proxy_id=None,
+            proxy_url="http://keep-dyn.example:9500",
+        )
+        registration_routes.update_proxy_usage(
+            session,
+            proxy_id=None,
+            proxy_url="http://keep-dyn.example:9500",
+        )
+
+        registration_routes.cleanup_failed_proxy(
+            session,
+            proxy_id=None,
+            proxy_url="http://keep-dyn.example:9500",
+            task_uuid="task-keep-1",
+            error_message="verification error",
+        )
+        registration_routes.cleanup_failed_proxy(
+            session,
+            proxy_id=None,
+            proxy_url="http://keep-dyn.example:9500",
+            task_uuid="task-keep-2",
+            error_message="verification error",
+        )
+        registration_routes.cleanup_failed_proxy(
+            session,
+            proxy_id=None,
+            proxy_url="http://keep-dyn.example:9500",
+            task_uuid="task-keep-3",
+            error_message="verification error",
+        )
+
+    with manager.session_scope() as session:
+        left = (
+            session.query(Proxy)
+            .filter(Proxy.host == "keep-dyn.example", Proxy.port == 9500)
+            .count()
+        )
+        assert left == 1
 
 
 def test_cleanup_failed_proxy_no_matching_record_is_noop(tmp_path):
