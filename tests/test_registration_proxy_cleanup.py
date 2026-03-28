@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import contextmanager
+from pathlib import Path
 
 from src.database import crud
 from src.database.models import Base, Proxy
@@ -496,3 +497,18 @@ def test_batch_pipeline_reports_feedback_only_once_per_task(monkeypatch, tmp_pat
     assert feedback_calls[0]["url"] == "http://127.0.0.1:8001/feedback"
     assert feedback_calls[0]["json"]["proxy"] == "http://once-pipeline.example:9100"
     assert feedback_calls[0]["json"]["success"] is True
+
+
+def test_registration_route_models_defined_once():
+    path = Path(registration_routes.__file__)
+    content = path.read_text(encoding="utf-8")
+
+    assert content.count("class RegistrationTaskCreate(BaseModel):") == 1
+    assert content.count("class BatchRegistrationRequest(BaseModel):") == 1
+    assert content.count("class RegistrationTaskResponse(BaseModel):") == 1
+    assert content.count("class BatchRegistrationResponse(BaseModel):") == 1
+    assert content.count("class TaskListResponse(BaseModel):") == 1
+    assert content.count("class OutlookAccountForRegistration(BaseModel):") == 1
+    assert content.count("class OutlookAccountsListResponse(BaseModel):") == 1
+    assert content.count("class OutlookBatchRegistrationRequest(BaseModel):") == 1
+    assert content.count("class OutlookBatchRegistrationResponse(BaseModel):") == 1
