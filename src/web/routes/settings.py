@@ -808,6 +808,19 @@ async def batch_delete_proxy_items(request: ProxyBatchDeleteRequest):
     }
 
 
+@router.post("/proxies/cleanup-disabled")
+async def cleanup_disabled_proxy_items():
+    """清理所有已禁用代理"""
+    with get_db() as db:
+        deleted_count = crud.delete_disabled_proxies(db)
+
+    return {
+        "success": True,
+        "message": "清理完成",
+        "deleted_count": deleted_count,
+    }
+
+
 @router.post("/proxies/{proxy_id}/set-default")
 async def set_proxy_default(proxy_id: int):
     """将指定代理设为默认"""

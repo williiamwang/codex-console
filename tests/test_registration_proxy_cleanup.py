@@ -83,7 +83,7 @@ def test_cleanup_failed_proxy_syncs_fail_count_by_host_port(tmp_path):
         assert other.last_failure_reason == "other-old"
 
 
-def test_cleanup_failed_proxy_deletes_all_records_on_5th_failure(tmp_path):
+def test_cleanup_failed_proxy_deletes_all_records_on_3rd_failure(tmp_path):
     manager = _build_manager(tmp_path)
 
     with manager.session_scope() as session:
@@ -94,7 +94,7 @@ def test_cleanup_failed_proxy_deletes_all_records_on_5th_failure(tmp_path):
             port=9100,
             username="u1",
             password="p1",
-            fail_count=4,
+            fail_count=2,
             reason="old-1",
         )
         p2 = _create_proxy(
@@ -184,6 +184,38 @@ def test_update_proxy_usage_resets_all_records_by_host_port_from_url(tmp_path):
         other = session.query(Proxy).filter(Proxy.host == "other.example", Proxy.port == 9201).one()
         assert other.fail_count == 3
         assert other.last_failure_reason == "other reason"
+
+
+def test_cleanup_failed_proxy_transient_error_uses_higher_threshold(tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with manager.session_scope() as session:
+        _create_proxy(
+            session,
+            name="p1",
+            host="transient.example",
+            port=9400,
+            fail_count=2,
+            reason="old",
+        )
+
+        registration_routes.cleanup_failed_proxy(
+            session,
+            proxy_id=None,
+            proxy_url="http://transient.example:9400",
+            task_uuid="task-transient",
+            error_message="connect timeout",
+        )
+
+    with manager.session_scope() as session:
+        left = (
+            session.query(Proxy)
+            .filter(Proxy.host == "transient.example", Proxy.port == 9400)
+            .count()
+        )
+        assert left == 1
+        proxy = session.query(Proxy).filter(Proxy.host == "transient.example", Proxy.port == 9400).one()
+        assert proxy.fail_count == 3
 
 
 def test_cleanup_failed_proxy_no_matching_record_is_noop(tmp_path):

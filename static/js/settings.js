@@ -87,7 +87,7 @@ const elements = {
 
 // 选中的服务 ID
 let selectedServiceIds = new Set();
-let lastFailedProxyIds = [];
+let disabledProxyCount = 0;
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
@@ -808,8 +808,14 @@ async function loadProxies() {
     try {
         const data = await api.get('/settings/proxies');
         renderProxies(data.proxies);
+        disabledProxyCount = Array.isArray(data.proxies)
+            ? data.proxies.filter(proxy => proxy && proxy.enabled === false).length
+            : 0;
+        updateCleanupFailedProxiesButton();
     } catch (error) {
         console.error('加载代理列表失败:', error);
+        disabledProxyCount = 0;
+        updateCleanupFailedProxiesButton();
         elements.proxiesTable.innerHTML = `
             <tr>
                 <td colspan="7">
@@ -1077,7 +1083,7 @@ async function deleteProxyItem(id) {
 
 function updateCleanupFailedProxiesButton() {
     if (!elements.cleanupFailedProxiesBtn) return;
-    elements.cleanupFailedProxiesBtn.disabled = lastFailedProxyIds.length === 0;
+    elements.cleanupFailedProxiesBtn.disabled = disabledProxyCount === 0;
 }
 
 // 测试所有代理
@@ -1092,9 +1098,6 @@ async function handleTestAllProxies() {
             auto_disable_failed: autoDisableFailed
         });
 
-        lastFailedProxyIds = Array.isArray(result.failed_ids) ? [...new Set(result.failed_ids)] : [];
-        updateCleanupFailedProxiesButton();
-
         const autoDisabledCount = result.auto_disabled || 0;
         const suffix = autoDisableFailed ? `，自动禁用 ${autoDisabledCount}` : '';
         toast.info(`测试完成: 成功 ${result.success}, 失败 ${result.failed}${suffix}`);
@@ -1108,13 +1111,13 @@ async function handleTestAllProxies() {
 }
 
 async function handleCleanupFailedProxies() {
-    if (!lastFailedProxyIds.length) {
-        toast.info('暂无可清理的失败代理，请先执行“测试全部”');
+    if (disabledProxyCount === 0) {
+        toast.info('暂无可清理的禁用代理');
         updateCleanupFailedProxiesButton();
         return;
     }
 
-    const confirmed = await confirm(`确定清理最近一次测试失败的 ${lastFailedProxyIds.length} 个代理吗？`);
+    const confirmed = await confirm(`确定清理当前所有禁用状态的 ${disabledProxyCount} 个代理吗？`);
     if (!confirmed) return;
 
     const btn = elements.cleanupFailedProxiesBtn;
@@ -1122,29 +1125,16 @@ async function handleCleanupFailedProxies() {
     btn.innerHTML = '<span class="loading-spinner"></span> 清理中...';
 
     try {
-        const result = await api.post('/settings/proxies/batch-delete', {
-            proxy_ids: lastFailedProxyIds
-        });
-
-        const deletedIds = Array.isArray(result.deleted_ids) ? result.deleted_ids : [];
-        const notFoundIds = Array.isArray(result.not_found_ids) ? result.not_found_ids : [];
-
-        lastFailedProxyIds = notFoundIds;
-        updateCleanupFailedProxiesButton();
-
-        if (notFoundIds.length > 0) {
-            toast.warning(`清理完成: 成功 ${deletedIds.length}，未找到 ${notFoundIds.length}`);
-        } else {
-            toast.success(`清理完成: 成功删除 ${deletedIds.length} 个失败代理`);
-        }
-
+        const result = await api.post('/settings/proxies/cleanup-disabled');
+        const deletedCount = Number(result.deleted_count || 0);
+        toast.success(`清理完成: 成功删除 ${deletedCount} 个禁用代理`);
         await loadProxies();
     } catch (error) {
         toast.error('清理失败: ' + error.message);
         updateCleanupFailedProxiesButton();
     } finally {
-        btn.disabled = lastFailedProxyIds.length === 0;
         btn.textContent = '🧹 清理失败项';
+        updateCleanupFailedProxiesButton();
     }
 }
 

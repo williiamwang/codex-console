@@ -478,6 +478,13 @@ def delete_proxies_by_host_port(db: Session, host: str, port: int) -> int:
     return deleted
 
 
+def delete_disabled_proxies(db: Session) -> int:
+    """删除所有已禁用代理，返回删除行数"""
+    deleted = db.query(Proxy).filter(Proxy.enabled == False).delete(synchronize_session=False)
+    db.commit()
+    return deleted
+
+
 def update_proxy(
     db: Session,
     proxy_id: int,

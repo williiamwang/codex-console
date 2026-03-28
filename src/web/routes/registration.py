@@ -188,9 +188,32 @@ def _resolve_proxy_id_from_url(db, proxy_url: Optional[str]) -> Optional[int]:
     return proxies[0].id
 
 
+def _is_transient_proxy_failure(error_message: Optional[str]) -> bool:
+    """是否为可能的瞬时网络错误（降低误删风险）。"""
+    if not error_message:
+        return False
+    message = error_message.lower()
+    transient_keywords = (
+        "timeout",
+        "timed out",
+        "temporarily",
+        "temporary",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "network is unreachable",
+        "tls",
+        "ssl",
+        "eof",
+        "dns",
+    )
+    return any(keyword in message for keyword in transient_keywords)
+
+
 def should_delete_proxy_after_failure(error_message: Optional[str], fail_count: int) -> bool:
-    """失败删除判定：仅当连续失败达到 5 次才删除。"""
-    return fail_count >= 5
+    """失败删除判定：常规连续失败>=3删除；瞬时网络错误提高阈值到>=5。"""
+    threshold = 5 if _is_transient_proxy_failure(error_message) else 3
+    return fail_count >= threshold
 
 
 def cleanup_failed_proxy(
@@ -200,7 +223,12 @@ def cleanup_failed_proxy(
     error_message: Optional[str] = None,
     proxy_url: Optional[str] = None,
 ):
-    """注册失败时按 host:port 统一计数并在达到阈值后删除全部记录。"""
+    """注册失败时按 host:port 统一计数并在达到阈值后删除全部记录。
+
+    判定策略：
+    - 常规错误：连续失败 >= 3 删除
+    - 瞬时网络错误：连续失败 >= 5 删除（防止偶发网络波动误删）
+    """
     target = _resolve_proxy_host_port(db, proxy_id, proxy_url)
     if not target:
         return

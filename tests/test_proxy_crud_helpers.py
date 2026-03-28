@@ -1,12 +1,34 @@
 from src.database.crud import (
     bulk_update_proxies_by_host_port,
     create_proxy,
+    delete_disabled_proxies,
     delete_proxies_by_host_port,
     get_proxies,
     get_proxies_by_host_port,
 )
 from src.database.models import Base
 from src.database.session import DatabaseSessionManager
+
+
+def test_delete_disabled_proxies_only_removes_disabled_items(tmp_path):
+    db_path = tmp_path / "proxy_crud_helpers_disabled.db"
+    manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+    Base.metadata.create_all(bind=manager.engine)
+
+    session = manager.SessionLocal()
+    try:
+        create_proxy(session, name="enabled-1", type="http", host="a.example", port=8001, enabled=True)
+        create_proxy(session, name="disabled-1", type="http", host="b.example", port=8002, enabled=False)
+        create_proxy(session, name="disabled-2", type="http", host="c.example", port=8003, enabled=False)
+
+        deleted_count = delete_disabled_proxies(session)
+        assert deleted_count == 2
+
+        remaining = get_proxies(session, limit=20)
+        remaining_names = sorted([item.name for item in remaining])
+        assert remaining_names == ["enabled-1"]
+    finally:
+        session.close()
 
 
 def test_proxy_helpers_query_update_delete_by_normalized_host_port(tmp_path):
