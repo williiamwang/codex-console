@@ -11,11 +11,28 @@
 
 - 交流群: https://qm.qq.com/q/ZTCKxawxeo
 
-## 致谢
+## 致谢 / Acknowledgements
 
-首先感谢上游项目作者 [cnlimiter](https://github.com/cnlimiter) 提供的优秀基础工程。
+### 中文
 
-本仓库是在原项目思路和结构之上进行兼容性修复、流程调整和体验优化，适合作为一个“当前可用的修复维护版”继续使用。
+本项目基于上游仓库 **[cnlimiter/codex-manager](https://github.com/cnlimiter/codex-manager)** 的架构与实现进行改造和持续维护。
+
+特别感谢上游作者 **[cnlimiter](https://github.com/cnlimiter)** 提供的优秀基础工程。当前仓库主要在此基础上做兼容性修复、流程调整与稳定性增强。
+
+### English
+
+This project is a maintained and enhanced fork built on top of **[cnlimiter/codex-manager](https://github.com/cnlimiter/codex-manager)**.
+
+Special thanks to **[cnlimiter](https://github.com/cnlimiter)** for the original architecture and implementation. This repository focuses on compatibility fixes, workflow adjustments, and stability improvements.
+
+> Forked and improved from `cnlimiter/codex-manager` with gratitude.
+
+## README Language
+
+- 中文：本 README 以中文为主，并补充关键英文说明。
+- English: This README is primarily in Chinese, with key sections provided in English.
+
+If you need a fully English README, feel free to open an issue or PR.
 
 ## 这个分支修了什么
 
