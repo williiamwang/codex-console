@@ -33,30 +33,110 @@ batch_tasks: Dict[str, dict] = {}
 
 # ============== Proxy Helper Functions ==============
 
+DYNAMIC_PREFER_THRESHOLD = 10
+POOL_PREFER_THRESHOLD = 10
+
+
+def _get_enabled_proxy_count(db) -> int:
+    return int(crud.get_proxies_count(db, enabled=True) or 0)
+
+
+def _fetch_dynamic_proxy_url() -> Optional[str]:
+    settings = get_settings()
+    if not settings.proxy_dynamic_enabled or not settings.proxy_dynamic_api_url:
+        return None
+
+    from ...core.dynamic_proxy import fetch_dynamic_proxy
+
+    api_key = settings.proxy_dynamic_api_key.get_secret_value() if settings.proxy_dynamic_api_key else ""
+    return fetch_dynamic_proxy(
+        api_url=settings.proxy_dynamic_api_url,
+        api_key=api_key,
+        api_key_header=settings.proxy_dynamic_api_key_header,
+        result_field=settings.proxy_dynamic_result_field,
+    )
+
+
+def backfill_proxy_if_dynamic_success(db, proxy_id: Optional[int], proxy_url: Optional[str]):
+    """仅在本次使用动态代理成功时回灌到代理池（去重）。"""
+    if proxy_id:
+        return
+
+    endpoint = _parse_proxy_endpoint(proxy_url)
+    if not endpoint:
+        return
+
+    host, port = endpoint
+    existed = _get_proxy_group_by_host_port(db, host, port)
+    if existed:
+        return
+
+    raw = (proxy_url or "").strip()
+    scheme = "http"
+    username = None
+    password = None
+
+    if raw:
+        parsed = urlsplit(raw if "://" in raw else f"http://{raw}")
+        scheme = (parsed.scheme or "http").lower()
+        username = parsed.username
+        password = parsed.password
+
+    proxy_type = "socks5" if scheme.startswith("socks5") else "http"
+
+    crud.create_proxy(
+        db,
+        name=f"动态回灌-{host}:{port}",
+        type=proxy_type,
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        enabled=True,
+        priority=0,
+    )
+
+
 def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
     """
     获取用于注册的代理
 
     策略：
-    1. 优先从代理列表中随机选择一个启用的代理
-    2. 如果代理列表为空且启用了动态代理，调用动态代理 API 获取
-    3. 否则使用系统设置中的静态默认代理
+    1. 启用代理数 < 10：优先动态代理，失败回退代理池
+    2. 启用代理数 >= 10：优先代理池，失败回退动态代理
+    3. 最终回退到静态 proxy_url
 
     Returns:
         Tuple[proxy_url, proxy_id]: 代理 URL 和代理 ID（如果来自代理列表）
     """
-    # 先尝试从代理列表中获取
-    proxy = crud.get_random_proxy(db)
-    if proxy:
-        return proxy.proxy_url, proxy.id
+    enabled_count = _get_enabled_proxy_count(db)
 
-    # 代理列表为空，尝试动态代理或静态代理
-    from ...core.dynamic_proxy import get_proxy_url_for_task
-    proxy_url = get_proxy_url_for_task()
-    if proxy_url:
-        return proxy_url, None
+    if enabled_count < DYNAMIC_PREFER_THRESHOLD:
+        prefer_dynamic = True
+    elif enabled_count >= POOL_PREFER_THRESHOLD:
+        prefer_dynamic = False
+    else:
+        prefer_dynamic = True
 
-    return None, None
+    if prefer_dynamic:
+        dynamic_url = _fetch_dynamic_proxy_url()
+        if dynamic_url:
+            return dynamic_url, None
+
+        pool_proxy = crud.get_random_proxy(db)
+        if pool_proxy:
+            return pool_proxy.proxy_url, pool_proxy.id
+    else:
+        pool_proxy = crud.get_random_proxy(db)
+        if pool_proxy:
+            return pool_proxy.proxy_url, pool_proxy.id
+
+        dynamic_url = _fetch_dynamic_proxy_url()
+        if dynamic_url:
+            return dynamic_url, None
+
+    settings = get_settings()
+    return settings.proxy_url, None
 
 
 def _parse_proxy_endpoint(proxy_url: Optional[str]) -> Optional[Tuple[str, int]]:
@@ -726,6 +806,9 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             result = engine.run()
 
             if result.success:
+                # 动态代理成功时回灌到代理池（仅动态来源）
+                backfill_proxy_if_dynamic_success(db, proxy_id, actual_proxy_url)
+
                 # 更新代理使用时间
                 update_proxy_usage(db, proxy_id, actual_proxy_url)
 
@@ -1024,12 +1107,6 @@ async def run_batch_parallel(
                         add_batch_log(f"{prefix} [失败] 注册失败: {t.error_message}")
                     update_batch_status(completed=new_completed, success=new_success, failed=new_failed)
 
-                # 反馈给代理池
-                if t and t.proxy:
-                    try:
-                        requests.post("http://127.0.0.1:8001/feedback", json={"proxy": t.proxy, "success": t.status == "completed"}, timeout=3)
-                    except Exception:
-                        pass
 
     try:
         await asyncio.gather(*[_run_one(i, u) for i, u in enumerate(task_uuids)], return_exceptions=True)
@@ -1117,12 +1194,6 @@ async def run_batch_pipeline(
                         add_batch_log(f"{pfx} [失败] 注册失败: {t.error_message}")
                     update_batch_status(completed=new_completed, success=new_success, failed=new_failed)
 
-                # 反馈给代理池
-                if t and t.proxy:
-                    try:
-                        requests.post("http://127.0.0.1:8001/feedback", json={"proxy": t.proxy, "success": t.status == "completed"}, timeout=3)
-                    except Exception:
-                        pass
 
     try:
         for i, task_uuid in enumerate(task_uuids):

@@ -1,6 +1,130 @@
+import asyncio
+from contextlib import contextmanager
+
+from src.database import crud
 from src.database.models import Base, Proxy
 from src.database.session import DatabaseSessionManager
 from src.web.routes import registration as registration_routes
+
+
+class _FakeSettings:
+    def __init__(self, dynamic_enabled=True, dynamic_api_url="http://dynamic.api", proxy_url=None):
+        self.proxy_dynamic_enabled = dynamic_enabled
+        self.proxy_dynamic_api_url = dynamic_api_url
+        self.proxy_url = proxy_url
+        self.proxy_dynamic_api_key = None
+        self.proxy_dynamic_api_key_header = "X-API-Key"
+        self.proxy_dynamic_result_field = ""
+
+
+def _fill_enabled_proxies(session, count):
+    for i in range(count):
+        crud.create_proxy(
+            session,
+            name=f"pool-{i}",
+            type="http",
+            host=f"pool-{i}.example",
+            port=8000 + i,
+            enabled=True,
+        )
+
+
+def _get_proxy_by_name(session, name):
+    return session.query(Proxy).filter(Proxy.name == name).first()
+
+
+def test_get_proxy_for_registration_prefers_dynamic_when_pool_below_10(monkeypatch, tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with manager.session_scope() as session:
+        _fill_enabled_proxies(session, 9)
+
+        monkeypatch.setattr(registration_routes, "get_settings", lambda: _FakeSettings(dynamic_enabled=True))
+        monkeypatch.setattr(registration_routes, "_fetch_dynamic_proxy_url", lambda: "http://dyn.example:9000")
+
+        proxy_url, proxy_id = registration_routes.get_proxy_for_registration(session)
+
+        assert proxy_url == "http://dyn.example:9000"
+        assert proxy_id is None
+
+
+def test_get_proxy_for_registration_prefers_pool_when_pool_reaches_10(monkeypatch, tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with manager.session_scope() as session:
+        _fill_enabled_proxies(session, 10)
+
+        monkeypatch.setattr(registration_routes, "get_settings", lambda: _FakeSettings(dynamic_enabled=True))
+        monkeypatch.setattr(registration_routes, "_fetch_dynamic_proxy_url", lambda: "http://dyn.example:9000")
+
+        proxy_url, proxy_id = registration_routes.get_proxy_for_registration(session)
+
+        assert proxy_id is not None
+        assert proxy_url is not None
+        assert "dyn.example" not in proxy_url
+
+
+def test_backfill_dynamic_proxy_on_success_creates_proxy_record(tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with manager.session_scope() as session:
+        registration_routes.backfill_proxy_if_dynamic_success(
+            session,
+            proxy_id=None,
+            proxy_url="http://newdyn.example:9443",
+        )
+
+        created = _get_proxy_by_name(session, "动态回灌-newdyn.example:9443")
+        assert created is not None
+        assert created.host == "newdyn.example"
+        assert created.port == 9443
+        assert created.enabled is True
+
+
+def test_backfill_dynamic_proxy_on_success_skips_when_already_exists(tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with manager.session_scope() as session:
+        crud.create_proxy(
+            session,
+            name="existing",
+            type="http",
+            host="dup.example",
+            port=9001,
+            enabled=True,
+        )
+
+        registration_routes.backfill_proxy_if_dynamic_success(
+            session,
+            proxy_id=None,
+            proxy_url="http://dup.example:9001",
+        )
+
+        matched = session.query(Proxy).filter(Proxy.host == "dup.example", Proxy.port == 9001).all()
+        assert len(matched) == 1
+
+
+def test_backfill_dynamic_proxy_on_success_skips_pool_proxy(tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with manager.session_scope() as session:
+        existing = crud.create_proxy(
+            session,
+            name="pool-item",
+            type="http",
+            host="pool.example",
+            port=9050,
+            enabled=True,
+        )
+
+        registration_routes.backfill_proxy_if_dynamic_success(
+            session,
+            proxy_id=existing.id,
+            proxy_url=existing.proxy_url,
+        )
+
+        matched = session.query(Proxy).filter(Proxy.host == "pool.example", Proxy.port == 9050).all()
+        assert len(matched) == 1
 
 
 def _build_manager(tmp_path):
@@ -246,3 +370,129 @@ def test_cleanup_failed_proxy_no_matching_record_is_noop(tmp_path):
         assert items[0].port == 9300
         assert items[0].fail_count == 1
         assert items[0].last_failure_reason == "exists"
+
+
+def test_batch_parallel_reports_feedback_only_once_per_task(monkeypatch, tmp_path):
+    manager = _build_manager(tmp_path)
+    feedback_calls = []
+
+    class _Resp:
+        status_code = 200
+
+    def fake_post(url, json=None, timeout=None):
+        feedback_calls.append({"url": url, "json": json, "timeout": timeout})
+        return _Resp()
+
+    async def fake_run_registration_task(*args, **kwargs):
+        task_uuid = args[0]
+        proxy_url = "http://once.example:9000"
+        with manager.session_scope() as session:
+            registration_routes.crud.update_registration_task(
+                session,
+                task_uuid,
+                status="completed",
+                proxy=proxy_url,
+            )
+        registration_routes.requests.post(
+            "http://127.0.0.1:8001/feedback",
+            json={"proxy": proxy_url, "success": True},
+            timeout=3,
+        )
+
+
+    @contextmanager
+    def fake_get_db():
+        session = manager.SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr(registration_routes, "get_db", fake_get_db)
+    monkeypatch.setattr(registration_routes.requests, "post", fake_post)
+    monkeypatch.setattr(registration_routes, "run_registration_task", fake_run_registration_task)
+
+    task_uuid = "batch-feedback-task"
+    with manager.session_scope() as session:
+        registration_routes.crud.create_registration_task(session, task_uuid=task_uuid, proxy=None)
+
+    asyncio.run(
+        registration_routes.run_batch_parallel(
+            batch_id="batch-feedback",
+            task_uuids=[task_uuid],
+            email_service_type="tempmail",
+            proxy=None,
+            email_service_config=None,
+            email_service_id=None,
+            concurrency=1,
+        )
+    )
+
+    assert len(feedback_calls) == 1
+    assert feedback_calls[0]["url"] == "http://127.0.0.1:8001/feedback"
+    assert feedback_calls[0]["json"]["proxy"] == "http://once.example:9000"
+    assert feedback_calls[0]["json"]["success"] is True
+
+
+def test_batch_pipeline_reports_feedback_only_once_per_task(monkeypatch, tmp_path):
+    manager = _build_manager(tmp_path)
+    feedback_calls = []
+
+    class _Resp:
+        status_code = 200
+
+    def fake_post(url, json=None, timeout=None):
+        feedback_calls.append({"url": url, "json": json, "timeout": timeout})
+        return _Resp()
+
+    async def fake_run_registration_task(*args, **kwargs):
+        task_uuid = args[0]
+        proxy_url = "http://once-pipeline.example:9100"
+        with manager.session_scope() as session:
+            registration_routes.crud.update_registration_task(
+                session,
+                task_uuid,
+                status="completed",
+                proxy=proxy_url,
+            )
+        registration_routes.requests.post(
+            "http://127.0.0.1:8001/feedback",
+            json={"proxy": proxy_url, "success": True},
+            timeout=3,
+        )
+
+
+    @contextmanager
+    def fake_get_db():
+        session = manager.SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr(registration_routes, "get_db", fake_get_db)
+    monkeypatch.setattr(registration_routes.requests, "post", fake_post)
+    monkeypatch.setattr(registration_routes, "run_registration_task", fake_run_registration_task)
+
+    task_uuid = "batch-feedback-pipeline-task"
+    with manager.session_scope() as session:
+        registration_routes.crud.create_registration_task(session, task_uuid=task_uuid, proxy=None)
+
+    asyncio.run(
+        registration_routes.run_batch_pipeline(
+            batch_id="batch-feedback-pipeline",
+            task_uuids=[task_uuid],
+            email_service_type="tempmail",
+            proxy=None,
+            email_service_config=None,
+            email_service_id=None,
+            interval_min=0,
+            interval_max=0,
+            concurrency=1,
+        )
+    )
+
+    assert len(feedback_calls) == 1
+    assert feedback_calls[0]["url"] == "http://127.0.0.1:8001/feedback"
+    assert feedback_calls[0]["json"]["proxy"] == "http://once-pipeline.example:9100"
+    assert feedback_calls[0]["json"]["success"] is True
