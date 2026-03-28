@@ -9,7 +9,7 @@ import random
 import requests
 from datetime import datetime
 from typing import List, Optional, Dict, Tuple
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -59,14 +59,8 @@ def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
     return None, None
 
 
-def update_proxy_usage(db, proxy_id: Optional[int]):
-    """更新代理的使用时间"""
-    if proxy_id:
-        crud.update_proxy_last_used(db, proxy_id)
-
-
-def _resolve_proxy_id_from_url(db, proxy_url: Optional[str]) -> Optional[int]:
-    """根据实际代理 URL 尝试定位数据库中的代理 ID。"""
+def _parse_proxy_endpoint(proxy_url: Optional[str]) -> Optional[Tuple[str, int]]:
+    """从代理 URL 解析 host:port。"""
     if not proxy_url:
         return None
 
@@ -81,60 +75,284 @@ def _resolve_proxy_id_from_url(db, proxy_url: Optional[str]) -> Optional[int]:
         parsed = urlsplit(raw)
         host = (parsed.hostname or "").strip().lower()
         port = parsed.port
-        username = unquote(parsed.username) if parsed.username else None
-        password = unquote(parsed.password) if parsed.password else None
     except Exception:
         return None
 
     if not host or not port:
         return None
 
-    proxy_type = (parsed.scheme or "http").lower()
-    if proxy_type == "https":
-        proxy_type = "http"
-    if proxy_type not in ("http", "socks5", "socks5h"):
-        return None
+    return host, int(port)
 
-    with_password = password if password is not None else None
-    with_username = username if username is not None else None
+
+def _resolve_proxy_host_port(db, proxy_id: Optional[int], proxy_url: Optional[str]) -> Optional[Tuple[str, int]]:
+    """优先从 proxy_id 解析 host:port，失败则回退到 proxy_url。"""
+    if proxy_id:
+        proxy_obj = crud.get_proxy_by_id(db, proxy_id)
+        if proxy_obj:
+            host = (proxy_obj.host or "").strip().lower()
+            port = int(proxy_obj.port) if proxy_obj.port else None
+            if host and port:
+                return host, port
+
+    return _parse_proxy_endpoint(proxy_url)
+
+
+def _get_proxy_group_by_host_port(db, host: str, port: int) -> List[Proxy]:
+    """获取同 host:port 的全部代理记录（不区分用户名密码）。"""
+    if hasattr(crud, "get_proxies_by_host_port"):
+        return list(crud.get_proxies_by_host_port(db, host=host, port=port) or [])
 
     candidates = crud.get_proxies(db, limit=1000000)
-    for p in candidates:
-        if (p.type or "").lower() != proxy_type:
-            continue
-        if (p.host or "").strip().lower() != host:
-            continue
-        if p.port != int(port):
-            continue
-        p_user = p.username if p.username is not None else None
-        p_pass = p.password if p.password is not None else None
-        if p_user == with_username and p_pass == with_password:
-            return p.id
-
-    # 兼容“只匹配 host:port:type”（当任务侧没有用户名密码时）
-    for p in candidates:
-        if (p.type or "").lower() == proxy_type and (p.host or "").strip().lower() == host and p.port == int(port):
-            return p.id
-
-    return None
+    return [
+        p for p in candidates
+        if (p.host or "").strip().lower() == host and int(p.port) == int(port)
+    ]
 
 
-def cleanup_failed_proxy(db, proxy_id: Optional[int], task_uuid: str):
-    """注册失败时同步删除本次使用的数据库代理整行记录。"""
-    if not proxy_id:
+def _apply_proxy_group_update(db, proxies: List[Proxy], **kwargs):
+    """守护式批量更新：优先调用 crud 批量函数，不存在则逐条更新。"""
+    if not proxies:
         return
 
-    if crud.delete_proxy(db, proxy_id):
-        logger.info(f"任务 {task_uuid} 注册失败，已同步删除失败代理整行记录 ID={proxy_id}")
-    else:
-        logger.warning(f"任务 {task_uuid} 注册失败，删除失败代理 ID={proxy_id} 未生效（可能已不存在）")
+    host = (proxies[0].host or "").strip().lower()
+    port = int(proxies[0].port)
 
-    # 立即检查删除结果，避免出现“IP 为空但行还在”的错觉
-    remained = crud.get_proxy_by_id(db, proxy_id)
-    if remained:
-        logger.error(f"任务 {task_uuid} 代理删除后仍存在 ID={proxy_id}，请检查并发写入")
-    else:
-        logger.info(f"任务 {task_uuid} 代理 ID={proxy_id} 已确认不存在")
+    if hasattr(crud, "bulk_update_proxies_by_host_port"):
+        crud.bulk_update_proxies_by_host_port(db, host=host, port=port, **kwargs)
+        return
+
+    for p in proxies:
+        crud.update_proxy(db, p.id, **kwargs)
+
+
+def _delete_proxy_group(db, proxies: List[Proxy], task_uuid: str):
+    """守护式批量删除：优先调用 crud 批量函数，不存在则逐条删除。"""
+    if not proxies:
+        return
+
+    host = (proxies[0].host or "").strip().lower()
+    port = int(proxies[0].port)
+
+    if hasattr(crud, "delete_proxies_by_host_port"):
+        deleted = crud.delete_proxies_by_host_port(db, host=host, port=port)
+        remained = len(_get_proxy_group_by_host_port(db, host, port))
+        if remained > 0:
+            logger.warning(f"任务 {task_uuid} 删除后仍存在同地址代理 host={host} port={port} remained={remained}")
+        logger.info(f"任务 {task_uuid} 删除同 host:port 代理记录 host={host} port={port}，删除数={deleted}")
+        return
+
+    deleted = 0
+    for p in proxies:
+        if crud.delete_proxy(db, p.id):
+            deleted += 1
+
+    remained = len(_get_proxy_group_by_host_port(db, host, port))
+    if remained > 0:
+        logger.warning(f"任务 {task_uuid} 删除后仍存在同地址代理 host={host} port={port} remained={remained}")
+    logger.info(f"任务 {task_uuid} 删除同 host:port 代理记录 host={host} port={port}，删除数={deleted}")
+
+
+def update_proxy_usage(db, proxy_id: Optional[int], proxy_url: Optional[str] = None):
+    """注册成功后按 host:port 清零失败计数并清空失败原因。"""
+    target = _resolve_proxy_host_port(db, proxy_id, proxy_url)
+    if not target:
+        return
+
+    host, port = target
+    proxies = _get_proxy_group_by_host_port(db, host, port)
+    if not proxies:
+        logger.info(f"代理成功回写无匹配记录，host={host} port={port}，跳过")
+        return
+
+    _apply_proxy_group_update(
+        db,
+        proxies,
+        fail_count=0,
+        last_failure_reason=None,
+    )
+
+    for p in proxies:
+        crud.update_proxy_last_used(db, p.id)
+
+
+def _resolve_proxy_id_from_url(db, proxy_url: Optional[str]) -> Optional[int]:
+    """根据实际代理 URL 尝试定位数据库中的代理 ID。"""
+    target = _parse_proxy_endpoint(proxy_url)
+    if not target:
+        return None
+
+    host, port = target
+    proxies = _get_proxy_group_by_host_port(db, host, port)
+    if not proxies:
+        return None
+    return proxies[0].id
+
+
+def should_delete_proxy_after_failure(error_message: Optional[str], fail_count: int) -> bool:
+    """失败删除判定：仅当连续失败达到 5 次才删除。"""
+    return fail_count >= 5
+
+
+def cleanup_failed_proxy(
+    db,
+    proxy_id: Optional[int],
+    task_uuid: str,
+    error_message: Optional[str] = None,
+    proxy_url: Optional[str] = None,
+):
+    """注册失败时按 host:port 统一计数并在达到阈值后删除全部记录。"""
+    target = _resolve_proxy_host_port(db, proxy_id, proxy_url)
+    if not target:
+        return
+
+    host, port = target
+    proxies = _get_proxy_group_by_host_port(db, host, port)
+    if not proxies:
+        logger.info(f"任务 {task_uuid} 代理失败回写无匹配记录，host={host} port={port}，跳过")
+        return
+
+    max_fail_count = max(int(getattr(p, "fail_count", 0) or 0) for p in proxies)
+    next_fail_count = max_fail_count + 1
+
+    _apply_proxy_group_update(
+        db,
+        proxies,
+        fail_count=next_fail_count,
+        last_failed_at=datetime.utcnow(),
+        last_failure_reason=(error_message or "")[:500],
+    )
+
+    if not should_delete_proxy_after_failure(error_message, next_fail_count):
+        logger.info(
+            f"任务 {task_uuid} 代理失败计数更新 host={host} port={port} fail_count={next_fail_count}，未达到删除阈值"
+        )
+        return
+
+    _delete_proxy_group(db, proxies, task_uuid)
+
+    if len(_get_proxy_group_by_host_port(db, host, port)) > 0:
+        logger.warning(f"任务 {task_uuid} 删除后仍存在同地址代理 host={host} port={port}")
+
+    logger.info(f"任务 {task_uuid} 同地址代理已按阈值删除 host={host} port={port} fail_count={next_fail_count}")
+
+
+# ============== Pydantic Models ==============
+
+# ============== Pydantic Models ==============
+
+class RegistrationTaskCreate(BaseModel):
+    """创建注册任务请求"""
+    email_service_type: str = "tempmail"
+    proxy: Optional[str] = None
+    email_service_config: Optional[dict] = None
+    email_service_id: Optional[int] = None
+    auto_upload_cpa: bool = False
+    cpa_service_ids: List[int] = []  # 指定 CPA 服务 ID 列表，空则取第一个启用的
+    auto_upload_sub2api: bool = False
+    sub2api_service_ids: List[int] = []  # 指定 Sub2API 服务 ID 列表
+    auto_upload_tm: bool = False
+    tm_service_ids: List[int] = []  # 指定 TM 服务 ID 列表
+
+
+class BatchRegistrationRequest(BaseModel):
+    """批量注册请求"""
+    count: int = 1
+    email_service_type: str = "tempmail"
+    proxy: Optional[str] = None
+    email_service_config: Optional[dict] = None
+    email_service_id: Optional[int] = None
+    interval_min: int = 5
+    interval_max: int = 30
+    concurrency: int = 1
+    mode: str = "pipeline"
+    auto_upload_cpa: bool = False
+    cpa_service_ids: List[int] = []
+    auto_upload_sub2api: bool = False
+    sub2api_service_ids: List[int] = []
+    auto_upload_tm: bool = False
+    tm_service_ids: List[int] = []
+
+
+class RegistrationTaskResponse(BaseModel):
+    """注册任务响应"""
+    id: int
+    task_uuid: str
+    status: str
+    email_service_id: Optional[int] = None
+    proxy: Optional[str] = None
+    logs: Optional[str] = None
+    result: Optional[dict] = None
+    error_message: Optional[str] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class BatchRegistrationResponse(BaseModel):
+    """批量注册响应"""
+    batch_id: str
+    count: int
+    tasks: List[RegistrationTaskResponse]
+
+
+class TaskListResponse(BaseModel):
+    """任务列表响应"""
+    total: int
+    tasks: List[RegistrationTaskResponse]
+
+
+# ============== Outlook 批量注册模型 ==============
+
+class OutlookAccountForRegistration(BaseModel):
+    """可用于注册的 Outlook 账户"""
+    id: int                      # EmailService 表的 ID
+    email: str
+    name: str
+    has_oauth: bool              # 是否有 OAuth 配置
+    is_registered: bool          # 是否已注册
+    registered_account_id: Optional[int] = None
+
+
+class OutlookAccountsListResponse(BaseModel):
+    """Outlook 账户列表响应"""
+    total: int
+    registered_count: int        # 已注册数量
+    unregistered_count: int      # 未注册数量
+    accounts: List[OutlookAccountForRegistration]
+
+
+class OutlookBatchRegistrationRequest(BaseModel):
+    """Outlook 批量注册请求"""
+    service_ids: List[int]
+    skip_registered: bool = True
+    proxy: Optional[str] = None
+    interval_min: int = 5
+    interval_max: int = 30
+    concurrency: int = 1
+    mode: str = "pipeline"
+    auto_upload_cpa: bool = False
+    cpa_service_ids: List[int] = []
+    auto_upload_sub2api: bool = False
+    sub2api_service_ids: List[int] = []
+    auto_upload_tm: bool = False
+    tm_service_ids: List[int] = []
+
+
+class OutlookBatchRegistrationResponse(BaseModel):
+    """Outlook 批量注册响应"""
+    batch_id: str
+    total: int                   # 总数
+    skipped: int                 # 跳过数（已注册）
+    to_register: int             # 待注册数
+    service_ids: List[int]       # 实际要注册的服务 ID
+
+
+# ============== Helper Functions ==============
+
+# ============== Pydantic Models ==============
 
 # ============== Pydantic Models ==============
 
@@ -481,7 +699,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
             if result.success:
                 # 更新代理使用时间
-                update_proxy_usage(db, proxy_id)
+                update_proxy_usage(db, proxy_id, actual_proxy_url)
 
                 # 保存到数据库
                 engine.save_to_database(result)
@@ -598,7 +816,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 )
 
                 failed_proxy_id = proxy_id if proxy_id else _resolve_proxy_id_from_url(db, actual_proxy_url)
-                cleanup_failed_proxy(db, failed_proxy_id, task_uuid)
+                cleanup_failed_proxy(db, failed_proxy_id, task_uuid, result.error_message, actual_proxy_url)
 
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "failed", error=result.error_message)
@@ -624,7 +842,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         error_message=str(e)
                     )
                     failed_proxy_id = proxy_id if proxy_id else _resolve_proxy_id_from_url(db, actual_proxy_url)
-                    cleanup_failed_proxy(db, failed_proxy_id, task_uuid)
+                    cleanup_failed_proxy(db, failed_proxy_id, task_uuid, str(e), actual_proxy_url)
 
                 # 更新 TaskManager 状态
                 task_manager.update_status(task_uuid, "failed", error=str(e))

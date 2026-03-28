@@ -186,6 +186,9 @@ class Proxy(Base):
     enabled = Column(Boolean, default=True)
     is_default = Column(Boolean, default=False)  # 是否为默认代理
     priority = Column(Integer, default=0)  # 优先级（保留字段）
+    fail_count = Column(Integer, default=0)  # 连续失败次数（用于淘汰失败代理）
+    last_failed_at = Column(DateTime)  # 最近失败时间
+    last_failure_reason = Column(Text)  # 最近失败原因
     last_used = Column(DateTime)  # 最后使用时间
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -111,6 +111,9 @@ class DatabaseSessionManager:
             ("accounts", "subscription_at", "DATETIME"),
             ("accounts", "cookies", "TEXT"),
             ("proxies", "is_default", "BOOLEAN DEFAULT 0"),
+            ("proxies", "fail_count", "INTEGER DEFAULT 0"),
+            ("proxies", "last_failed_at", "DATETIME"),
+            ("proxies", "last_failure_reason", "TEXT"),
         ]
 
         # 确保新表存在（create_tables 已处理，此处兜底）

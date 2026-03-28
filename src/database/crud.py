@@ -442,6 +442,42 @@ def get_enabled_proxies(db: Session) -> List[Proxy]:
     return db.query(Proxy).filter(Proxy.enabled == True).all()
 
 
+def get_proxies_by_host_port(db: Session, host: str, port: int) -> List[Proxy]:
+    """按 host:port 获取代理（host 使用 lower().strip() 归一化匹配）"""
+    normalized_host = host.strip().lower()
+    return (
+        db.query(Proxy)
+        .filter(func.lower(func.trim(Proxy.host)) == normalized_host, Proxy.port == port)
+        .all()
+    )
+
+
+def bulk_update_proxies_by_host_port(db: Session, host: str, port: int, **kwargs) -> int:
+    """按 host:port 批量更新代理，返回更新行数"""
+    if not kwargs:
+        return 0
+    normalized_host = host.strip().lower()
+    updated = (
+        db.query(Proxy)
+        .filter(func.lower(func.trim(Proxy.host)) == normalized_host, Proxy.port == port)
+        .update(kwargs, synchronize_session=False)
+    )
+    db.commit()
+    return updated
+
+
+def delete_proxies_by_host_port(db: Session, host: str, port: int) -> int:
+    """按 host:port 批量删除代理，返回删除行数"""
+    normalized_host = host.strip().lower()
+    deleted = (
+        db.query(Proxy)
+        .filter(func.lower(func.trim(Proxy.host)) == normalized_host, Proxy.port == port)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return deleted
+
+
 def update_proxy(
     db: Session,
     proxy_id: int,
