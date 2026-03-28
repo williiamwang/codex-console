@@ -415,6 +415,54 @@ def test_cleanup_failed_proxy_keeps_recently_successful_dynamic_backfill(tmp_pat
         assert left == 1
 
 
+def test_cleanup_failed_proxy_with_auth_only_affects_same_auth_proxy(tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with manager.session_scope() as session:
+        registration_routes.backfill_proxy_if_dynamic_success(
+            session,
+            proxy_id=None,
+            proxy_url="http://good_user:good_pass@same-auth.example:9600",
+        )
+        registration_routes.backfill_proxy_if_dynamic_success(
+            session,
+            proxy_id=None,
+            proxy_url="http://bad_user:bad_pass@same-auth.example:9600",
+        )
+
+        registration_routes.update_proxy_usage(
+            session,
+            proxy_id=None,
+            proxy_url="http://good_user:good_pass@same-auth.example:9600",
+        )
+
+        for i in range(5):
+            registration_routes.cleanup_failed_proxy(
+                session,
+                proxy_id=None,
+                proxy_url="http://bad_user:bad_pass@same-auth.example:9600",
+                task_uuid=f"task-auth-{i}",
+                error_message="verification error",
+            )
+
+    with manager.session_scope() as session:
+        good = session.query(Proxy).filter(
+            Proxy.host == "same-auth.example",
+            Proxy.port == 9600,
+            Proxy.username == "good_user",
+            Proxy.password == "good_pass",
+        ).all()
+        bad = session.query(Proxy).filter(
+            Proxy.host == "same-auth.example",
+            Proxy.port == 9600,
+            Proxy.username == "bad_user",
+            Proxy.password == "bad_pass",
+        ).all()
+
+        assert len(good) == 1
+        assert len(bad) == 0
+
+
 def test_cleanup_failed_proxy_no_matching_record_is_noop(tmp_path):
     manager = _build_manager(tmp_path)
 

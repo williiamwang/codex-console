@@ -176,6 +176,99 @@ def _parse_proxy_endpoint(proxy_url: Optional[str]) -> Optional[Tuple[str, int]]
     return host, int(port)
 
 
+def _parse_proxy_identity(proxy_url: Optional[str]) -> Optional[Tuple[str, int, str, Optional[str], Optional[str]]]:
+    """从代理 URL 解析 type/host/port/username/password。"""
+    if not proxy_url:
+        return None
+
+    raw = proxy_url.strip()
+    if not raw:
+        return None
+
+    if "://" not in raw:
+        raw = f"http://{raw}"
+
+    try:
+        parsed = urlsplit(raw)
+    except Exception:
+        return None
+
+    host = (parsed.hostname or "").strip().lower()
+    port = parsed.port
+    if not host or not port:
+        return None
+
+    scheme = (parsed.scheme or "http").lower()
+    proxy_type = "socks5" if scheme.startswith("socks5") else "http"
+    username = parsed.username or None
+    password = parsed.password or None
+
+    return host, int(port), proxy_type, username, password
+
+
+def _get_proxy_group_by_identity(
+    db,
+    host: str,
+    port: int,
+    proxy_type: str,
+    username: Optional[str],
+    password: Optional[str],
+) -> List[Proxy]:
+    """获取同 type+host+port+username+password 的代理记录。"""
+    group = _get_proxy_group_by_host_port(db, host, port)
+    return [
+        p
+        for p in group
+        if (p.type or "http") == proxy_type
+        and (p.username or None) == (username or None)
+        and (p.password or None) == (password or None)
+    ]
+
+
+def _should_scope_proxy_group_by_identity(proxy_url: Optional[str]) -> bool:
+    identity = _parse_proxy_identity(proxy_url)
+    if not identity:
+        return False
+    _, _, _, username, password = identity
+    return bool(username or password)
+
+
+def _select_cleanup_proxies(db, proxy_id: Optional[int], proxy_url: Optional[str]) -> Tuple[Optional[Tuple[str, int]], List[Proxy], bool]:
+    """选择失败清理作用域。
+
+    - 代理池代理（proxy_id 存在）沿用 host:port 分组。
+    - 动态代理（proxy_id 不存在）若带认证信息，则仅清理同认证记录，避免误伤同 host:port 的其他账号。
+
+    Returns:
+        (target, proxies, scoped_by_identity)
+    """
+    target = _resolve_proxy_host_port(db, proxy_id, proxy_url)
+    if not target:
+        return None, [], False
+
+    host, port = target
+
+    if not proxy_id and _should_scope_proxy_group_by_identity(proxy_url):
+        identity = _parse_proxy_identity(proxy_url)
+        if identity:
+            _, _, proxy_type, username, password = identity
+            scoped = _get_proxy_group_by_identity(db, host, port, proxy_type, username, password)
+            if scoped:
+                return target, scoped, True
+
+    return target, _get_proxy_group_by_host_port(db, host, port), False
+
+
+def _resolve_failed_proxy_id(proxy_id: Optional[int]) -> Optional[int]:
+    """失败清理仅保留显式代理池 ID，动态代理走 URL 解析。"""
+    return proxy_id or None
+
+
+def _resolve_success_proxy_id(proxy_id: Optional[int]) -> Optional[int]:
+    """成功回写仅保留显式代理池 ID，动态代理走 URL 解析。"""
+    return proxy_id or None
+
+
 def _resolve_proxy_host_port(db, proxy_id: Optional[int], proxy_url: Optional[str]) -> Optional[Tuple[str, int]]:
     """优先从 proxy_id 解析 host:port，失败则回退到 proxy_url。"""
     if proxy_id:
@@ -245,13 +338,27 @@ def _delete_proxy_group(db, proxies: List[Proxy], task_uuid: str):
 
 
 def update_proxy_usage(db, proxy_id: Optional[int], proxy_url: Optional[str] = None):
-    """注册成功后按 host:port 清零失败计数并清空失败原因。"""
+    """注册成功后回写代理使用。
+
+    - 代理池代理（proxy_id 存在）：沿用 host:port 分组清零。
+    - 动态代理（proxy_id 不存在）：若带认证信息，仅更新同认证记录；否则按 host:port。
+    """
     target = _resolve_proxy_host_port(db, proxy_id, proxy_url)
     if not target:
         return
 
     host, port = target
-    proxies = _get_proxy_group_by_host_port(db, host, port)
+
+    if not proxy_id and _should_scope_proxy_group_by_identity(proxy_url):
+        identity = _parse_proxy_identity(proxy_url)
+        if identity:
+            _, _, proxy_type, username, password = identity
+            proxies = _get_proxy_group_by_identity(db, host, port, proxy_type, username, password)
+        else:
+            proxies = []
+    else:
+        proxies = _get_proxy_group_by_host_port(db, host, port)
+
     if not proxies:
         logger.info(f"代理成功回写无匹配记录，host={host} port={port}，跳过")
         return
@@ -265,6 +372,31 @@ def update_proxy_usage(db, proxy_id: Optional[int], proxy_url: Optional[str] = N
 
     for p in proxies:
         crud.update_proxy_last_used(db, p.id)
+
+    if proxy_id:
+        return
+
+    identity = _parse_proxy_identity(proxy_url)
+    if not identity:
+        return
+
+    _, _, proxy_type, username, password = identity
+    if username is not None or password is not None:
+        existed_same_auth = _get_proxy_group_by_identity(db, host, port, proxy_type, username, password)
+        if not existed_same_auth:
+            backfill_proxy_if_dynamic_success(db, None, proxy_url)
+            existed_same_auth = _get_proxy_group_by_identity(db, host, port, proxy_type, username, password)
+            if existed_same_auth:
+                _apply_proxy_group_update(
+                    db,
+                    existed_same_auth,
+                    fail_count=0,
+                    last_failure_reason=None,
+                )
+                for p in existed_same_auth:
+                    crud.update_proxy_last_used(db, p.id)
+
+    return
 
 
 def _resolve_proxy_id_from_url(db, proxy_url: Optional[str]) -> Optional[int]:
@@ -327,12 +459,11 @@ def cleanup_failed_proxy(
     - 常规错误：连续失败 >= 3 删除
     - 瞬时网络错误：连续失败 >= 5 删除（防止偶发网络波动误删）
     """
-    target = _resolve_proxy_host_port(db, proxy_id, proxy_url)
+    target, proxies, scoped_by_identity = _select_cleanup_proxies(db, proxy_id, proxy_url)
     if not target:
         return
 
     host, port = target
-    proxies = _get_proxy_group_by_host_port(db, host, port)
     if not proxies:
         logger.info(f"任务 {task_uuid} 代理失败回写无匹配记录，host={host} port={port}，跳过")
         return
@@ -340,15 +471,44 @@ def cleanup_failed_proxy(
     max_fail_count = max(int(getattr(p, "fail_count", 0) or 0) for p in proxies)
     next_fail_count = max_fail_count + 1
 
-    _apply_proxy_group_update(
-        db,
-        proxies,
-        fail_count=next_fail_count,
-        last_failed_at=datetime.utcnow(),
-        last_failure_reason=(error_message or "")[:500],
-    )
+    if scoped_by_identity:
+        for p in proxies:
+            crud.update_proxy(
+                db,
+                p.id,
+                fail_count=next_fail_count,
+                last_failed_at=datetime.utcnow(),
+                last_failure_reason=(error_message or "")[:500],
+            )
+    else:
+        _apply_proxy_group_update(
+            db,
+            proxies,
+            fail_count=next_fail_count,
+            last_failed_at=datetime.utcnow(),
+            last_failure_reason=(error_message or "")[:500],
+        )
 
     has_recent_success = any(getattr(p, "last_used", None) is not None for p in proxies)
+    if scoped_by_identity:
+        has_recent_success = has_recent_success or any(
+            getattr(p, "last_used", None) is not None
+            for p in _get_proxy_group_by_host_port(db, host, port)
+        )
+
+    if scoped_by_identity:
+        if not should_delete_proxy_after_failure(error_message, next_fail_count, has_recent_success=has_recent_success):
+            logger.info(
+                f"任务 {task_uuid} 代理失败计数更新 host={host} port={port} fail_count={next_fail_count}，未达到删除阈值"
+            )
+            return
+
+        deleted = 0
+        for p in proxies:
+            if crud.delete_proxy(db, p.id):
+                deleted += 1
+        logger.info(f"任务 {task_uuid} 删除同认证代理记录 host={host} port={port}，删除数={deleted}")
+        return
 
     if not should_delete_proxy_after_failure(error_message, next_fail_count, has_recent_success=has_recent_success):
         logger.info(
@@ -362,6 +522,8 @@ def cleanup_failed_proxy(
         logger.warning(f"任务 {task_uuid} 删除后仍存在同地址代理 host={host} port={port}")
 
     logger.info(f"任务 {task_uuid} 同地址代理已按阈值删除 host={host} port={port} fail_count={next_fail_count}")
+
+    return
 
 
 # ============== Pydantic Models ==============
