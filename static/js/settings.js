@@ -846,9 +846,9 @@ function renderProxies(proxies) {
         return;
     }
 
-    elements.proxiesTable.innerHTML = proxies.map(proxy => `
+    elements.proxiesTable.innerHTML = proxies.map((proxy, index) => `
         <tr data-proxy-id="${proxy.id}">
-            <td>${proxy.id}</td>
+            <td>${index + 1}</td>
             <td>${escapeHtml(proxy.name)}</td>
             <td><span class="badge">${proxy.type.toUpperCase()}</span></td>
             <td><code>${escapeHtml(proxy.host)}:${proxy.port}</code></td>
